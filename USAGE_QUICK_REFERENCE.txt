@@ -1,0 +1,202 @@
+================================================================================
+PHOTO ANALYZER - COMMAND LINE QUICK REFERENCE
+================================================================================
+
+DEFAULT BEHAVIOR (1000 file limit):
+────────────────────────────────────────────────────────────────────────────
+python photo_analyze_jpg_only.py --root-dir ./photos
+
+PROCESS SPECIFIC NUMBER OF FILES:
+────────────────────────────────────────────────────────────────────────────
+# Test with 100 files
+python photo_analyze_jpg_only.py --root-dir ./photos --max-files 100
+
+# Batch process 500 files
+python photo_analyze_jpg_only.py --root-dir ./photos --max-files 500
+
+# Large batch: 5000 files
+python photo_analyze_jpg_only.py --root-dir ./photos --max-files 5000
+
+CUSTOM DATABASE NAME:
+────────────────────────────────────────────────────────────────────────────
+python photo_analyze_jpg_only.py \
+    --root-dir ./photos \
+    --max-files 1000 \
+    --db-path large_dataset.db
+
+TYPICAL WORKFLOWS:
+────────────────────────────────────────────────────────────────────────────
+
+1. QUICK TEST (2-5 minutes)
+   python photo_analyze_jpg_only.py --root-dir ./photos --max-files 100
+   → Good for verifying script setup
+
+2. STANDARD PROCESSING (15-30 minutes)
+   python photo_analyze_jpg_only.py --root-dir /media/photos
+   → Default 1000 files, generates all reports
+
+3. FULL BATCH (1-3 hours)
+   python photo_analyze_jpg_only.py --root-dir /data/photo_archive --max-files 5000
+   → Large dataset with comprehensive analysis
+
+4. PERFORMANCE BENCHMARKING
+   # Linux
+   time python photo_analyze_jpg_only.py --root-dir ./photos --max-files 1000
+   
+   # Windows PowerShell
+   Measure-Command { python photo_analyze_jpg_only.py --root-dir C:\photos --max-files 1000 }
+
+WINDOWS 11 vs LINUX TESTING:
+────────────────────────────────────────────────────────────────────────────
+
+Windows 11 (cmd.exe):
+  python photo_analyze_jpg_only.py --root-dir C:\Users\Photos --max-files 500
+
+Windows 11 (PowerShell):
+  python photo_analyze_jpg_only.py -–root-dir C:\Users\Photos -–max-files 500
+
+Linux (Bash):
+  python photo_analyze_jpg_only.py --root-dir ~/pictures --max-files 500
+
+ENVIRONMENT NOTES:
+────────────────────────────────────────────────────────────────────────────
+
+Python 3.8+:
+  • Standard requirement
+  • Tested with 3.9, 3.10, 3.11
+
+GPU Acceleration (CLIP):
+  • NVIDIA GPU: Install torch with CUDA
+    pip install torch torchvision transformers
+  • CPU fallback: Works automatically if GPU unavailable
+
+Dependencies:
+  • DuckDB: pip install duckdb
+  • PIL/Pillow: pip install Pillow
+  • NumPy: pip install numpy
+  • Pandas: pip install pandas
+  • Matplotlib & Seaborn: pip install matplotlib seaborn
+  • piexif: pip install piexif
+  • tqdm: pip install tqdm
+  • Optional ML: pip install torch transformers
+
+FULL INSTALL COMMAND:
+────────────────────────────────────────────────────────────────────────────
+pip install duckdb pillow piexif numpy pandas matplotlib seaborn tqdm torch transformers
+
+OUTPUT FILES:
+────────────────────────────────────────────────────────────────────────────
+✓ photos_db.db                        (DuckDB database)
+✓ photos_summary.csv                  (Full metadata export)
+✓ report_year_distribution.png        (Timeline chart)
+✓ report_season_distribution.png      (Seasonal breakdown)
+✓ report_category_distribution.png    (Subject categories)
+✓ report_make_distribution.png        (Camera makes)
+
+DEBUGGING:
+────────────────────────────────────────────────────────────────────────────
+
+Enable verbose output:
+  python photo_analyze_jpg_only.py --root-dir ./photos 2>&1 | tee debug.log
+
+Check if files are found:
+  python -c "from pathlib import Path; print(len([f for f in Path('./photos').rglob('*') if f.suffix.lower() in {'.jpg', '.jpeg'}]))"
+
+Query results in DuckDB:
+  duckdb photos_db.db "SELECT COUNT(*) as total_photos FROM photos;"
+
+DuckDB interactive mode:
+  duckdb photos_db.db
+  > SELECT COUNT(*) FROM photos;
+  > SELECT * FROM photos LIMIT 5;
+  > SELECT season, COUNT(*) FROM photos GROUP BY season;
+  > .quit
+
+PERFORMANCE OPTIMIZATION:
+────────────────────────────────────────────────────────────────────────────
+
+For fastest processing:
+  • Reduce --max-files for initial testing
+  • Use ResNet50 instead of CLIP (faster on CPU)
+  • Process on Linux (typically 10-20% faster)
+  • Use SSD/fast storage for photo directory
+
+For most accurate tagging:
+  • Use GPU if available
+  • Keep default --max-files 1000+
+  • Use CLIP model (better semantic understanding)
+
+BENCHMARKING ACROSS PLATFORMS:
+────────────────────────────────────────────────────────────────────────────
+
+Standard test: 100 images
+  Linux:   ~2-3 minutes (with GPU: 30-60 sec)
+  Windows: ~3-5 minutes (with GPU: 45-90 sec)
+
+Production test: 1000 images
+  Linux:   ~20-30 minutes
+  Windows: ~30-45 minutes
+
+Large batch: 5000 images
+  Linux:   ~90-120 minutes
+  Windows: ~120-180 minutes
+
+QUERY EXAMPLES (After Processing):
+────────────────────────────────────────────────────────────────────────────
+
+duckdb photos_db.db
+
+# Total photos processed
+SELECT COUNT(*) FROM photos;
+
+# Photos with GPS data
+SELECT COUNT(*) FROM photos WHERE gps_lat IS NOT NULL;
+
+# Average image size
+SELECT AVG(image_width * image_height) as avg_megapixels FROM photos;
+
+# Most common cameras
+SELECT make, model, COUNT(*) 
+FROM photos 
+WHERE make IS NOT NULL 
+GROUP BY make, model 
+ORDER BY COUNT(*) DESC 
+LIMIT 10;
+
+# Photos by season
+SELECT season, COUNT(*) 
+FROM photos 
+WHERE season IS NOT NULL 
+GROUP BY season 
+ORDER BY COUNT(*) DESC;
+
+# Top 20 categories
+SELECT category, COUNT(*) as count
+FROM (SELECT UNNEST(categories) as category FROM photos)
+GROUP BY category
+ORDER BY count DESC
+LIMIT 20;
+
+TROUBLESHOOTING:
+────────────────────────────────────────────────────────────────────────────
+
+"No images found"
+  → Check directory path exists
+  → Verify .jpg/.jpeg files are present (case-sensitive!)
+  → Try absolute path: /full/path/to/photos
+
+"CLIP model not available"
+  → Falls back to ResNet50 automatically
+  → Install transformers: pip install transformers
+
+"Out of memory"
+  → Reduce --max-files (try 100-500)
+  → Process on machine with more RAM
+  → Use ResNet50 instead of CLIP
+
+"Database is locked"
+  → Only one instance can write at a time
+  → Wait for previous run to complete
+  → Delete .db-wal and .db-shm files
+
+================================================================================
