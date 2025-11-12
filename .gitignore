@@ -29,6 +29,7 @@ ENV/
 *.db
 *.db-wal
 *.db-shm
+*.wal
 
 # AI Models and caches
 fine_tuned_model/
