@@ -2,6 +2,7 @@
 # modified to only process JPG files and no RAW
 #
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 photo_analyze_jpg_only.py
 
@@ -9,13 +10,13 @@ Scans ROOT_DIR for JPG/JPEG images only, extracts and normalizes EXIF datetimes,
 tags images (CLIP preferred, torchvision fallback), stores results in DuckDB
 using UUID primary keys, and generates summary graphs and a CSV.
 
-Fixes included:
+Includes:
 - Restrict to .jpg/.jpeg (case-insensitive)
 - Sets PIL.Image.MAX_IMAGE_PIXELS = 933120000
 - Normalizes EXIF datetime "YYYY:MM:DD HH:MM:SS" -> "YYYY-MM-DD HH:MM:SS"
-- Uses UUID text primary key (DuckDB has no autoincrement)
+- UUID text primary key (DuckDB has no autoincrement)
 - CLIP processor uses channels-last numpy arrays with input_data_format
-- Pandas explode/dropna fix
+- Pandas explode/dropna fix to avoid assignment errors
 """
 
 from pathlib import Path
@@ -178,6 +179,7 @@ def extract_exif(path: Path):
             if piexif.ExifIFD.FocalLength in exif:
                 data["focal_length"] = exif.get(piexif.ExifIFD.FocalLength)
         except Exception:
+            # fallback omitted for brevity; piexif usually covers common EXIF fields
             pass
     except Exception as e:
         print(f"[WARN] Could not open {path}: {e}", file=sys.stderr)
@@ -220,4 +222,272 @@ class Tagger:
     def predict_tags(self, image_path: Path, topk=8):
         tags = []
         try:
-            img = PILImage.open(image_path).
+            img = PILImage.open(image_path).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] Cannot open {image_path}: {e}", file=sys.stderr)
+            return tags
+
+        # CLIP branch: channels-last numpy array and explicit input_data_format
+        if self.use_clip:
+            try:
+                keyword_texts = ["a photo of a " + k for k in sum(COARSE_CATEGORIES.values(), [])]
+                img_arr = np.asarray(img)  # (H, W, C)
+                inputs = self.clip_processor(
+                    text=keyword_texts,
+                    images=[img_arr],
+                    return_tensors="pt",
+                    padding=True,
+                    input_data_format="channels_last"
+                )
+                inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+                with torch.no_grad():
+                    out = self.clip_model(**inputs)
+                    image_emb = out.image_embeds
+                    text_emb = out.text_embeds
+                    image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
+                    text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
+                    sims = (100.0 * image_emb @ text_emb.T).softmax(dim=-1)
+                    topk_idx = sims[0].argsort(descending=True)[:topk].cpu().numpy().tolist()
+                    tags = [keyword_texts[i].replace("a photo of a ", "") for i in topk_idx]
+            except Exception as e:
+                print(f"[INFO] CLIP predict failed, falling back: {e}", file=sys.stderr)
+                tags = []
+
+        # torchvision fallback
+        if not tags and self.use_torchvision:
+            try:
+                x = self.preprocess(img).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    out = self.model(x)
+                    probs = torch.nn.functional.softmax(out, dim=1)[0]
+                    topk_idx = torch.topk(probs, topk).indices.cpu().numpy().tolist()
+                    tags = [self.imagenet_labels[i] if i < len(self.imagenet_labels) else f"label{i}" for i in topk_idx]
+            except Exception as e:
+                print(f"[INFO] torchvision predict failed: {e}", file=sys.stderr)
+                tags = []
+
+        tags = [norm_text(str(t)) for t in tags if t]
+        ct = color_temperature_hint(img)
+        if ct:
+            tags.append(ct)
+        return list(dict.fromkeys(tags))
+
+def map_tags_to_categories(tags):
+    cats = set()
+    for cat, keywords in COARSE_CATEGORIES.items():
+        for kw in keywords:
+            for t in tags:
+                if kw in t:
+                    cats.add(cat)
+    return sorted(list(cats))
+
+# ---------- Database ----------
+def init_db(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS photos (
+        id TEXT PRIMARY KEY,
+        file_path TEXT,
+        file_name TEXT,
+        width INTEGER,
+        height INTEGER,
+        datetime_original TEXT,
+        year INTEGER,
+        month INTEGER,
+        season TEXT,
+        camera_make TEXT,
+        camera_model TEXT,
+        exposure_time TEXT,
+        f_number TEXT,
+        iso INTEGER,
+        focal_length TEXT,
+        tags TEXT,
+        categories TEXT
+    );
+    """)
+    conn.commit()
+
+def insert_record(conn, rec):
+    rid = rec.get("id") or uuid.uuid4().hex
+    conn.execute("""
+    INSERT INTO photos (
+        id, file_path, file_name, width, height, datetime_original, year, month, season,
+        camera_make, camera_model, exposure_time, f_number, iso, focal_length, tags, categories
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        rid,
+        rec.get("file_path"),
+        rec.get("file_name"),
+        rec.get("width"),
+        rec.get("height"),
+        rec.get("datetime_original"),
+        rec.get("year"),
+        rec.get("month"),
+        rec.get("season"),
+        rec.get("camera_make"),
+        rec.get("camera_model"),
+        str(rec.get("exposure_time")) if rec.get("exposure_time") is not None else None,
+        str(rec.get("f_number")) if rec.get("f_number") is not None else None,
+        rec.get("iso"),
+        str(rec.get("focal_length")) if rec.get("focal_length") is not None else None,
+        ",".join(rec.get("tags") or []),
+        ",".join(rec.get("categories") or [])
+    ))
+    conn.commit()
+    return rid
+
+# ---------- Reporting ----------
+def generate_reports(conn):
+    df = conn.execute("SELECT * FROM photos").fetchdf()
+    if df.empty:
+        print("[INFO] No photos found in DB to report.")
+        return
+
+    # Build categories_list, drop rows with empty categories before using explode
+    df["categories_list"] = df["categories"].fillna("").apply(lambda s: s.split(",") if s else [])
+    df_expl = df.explode("categories_list")
+    df_expl["categories_list"] = df_expl["categories_list"].replace("", pd.NA)
+    df_expl = df_expl.dropna(subset=["categories_list"])
+
+    sns.set(style="whitegrid")
+
+    # Photo type counts
+    plt.figure(figsize=(10,6))
+    type_counts = df_expl["categories_list"].value_counts()
+    sns.barplot(x=type_counts.values, y=type_counts.index, palette="viridis")
+    plt.title("Photo type counts")
+    plt.xlabel("Count")
+    plt.tight_layout()
+    plt.savefig("photo_type_counts.png", dpi=150)
+    plt.close()
+
+    # Photos per year
+    plt.figure(figsize=(10,6))
+    year_counts = df["year"].value_counts().sort_index()
+    sns.barplot(x=year_counts.index.astype(str), y=year_counts.values, palette="magma")
+    plt.title("Photos per year")
+    plt.xlabel("Year")
+    plt.ylabel("Count")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig("photos_per_year.png", dpi=150)
+    plt.close()
+
+    # ISO distribution
+    df_iso = df.dropna(subset=["iso"])
+    if not df_iso.empty:
+        plt.figure(figsize=(10,5))
+        sns.histplot(df_iso["iso"].astype(int), bins=30, kde=False, color="steelblue")
+        plt.title("ISO distribution")
+        plt.xlabel("ISO")
+        plt.tight_layout()
+        plt.savefig("iso_distribution.png", dpi=150)
+        plt.close()
+
+    # Aperture distribution
+    def parse_rat(r):
+        if pd.isna(r):
+            return None
+        try:
+            s = str(r)
+            if "/" in s:
+                a,b = s.split("/")
+                return float(a)/float(b)
+            return float(s)
+        except Exception:
+            return None
+
+    df["f_number_parsed"] = df["f_number"].apply(parse_rat)
+    df_fn = df.dropna(subset=["f_number_parsed"])
+    if not df_fn.empty:
+        plt.figure(figsize=(8,4))
+        sns.countplot(x=df_fn["f_number_parsed"].round(1).astype(str),
+                      palette="coolwarm",
+                      order=sorted(df_fn["f_number_parsed"].unique()))
+        plt.title("Aperture (F-number) distribution")
+        plt.xlabel("F-number")
+        plt.tight_layout()
+        plt.savefig("aperture_distribution.png", dpi=150)
+        plt.close()
+
+    # Top camera models
+    top_models = df["camera_model"].fillna("Unknown").value_counts().head(10)
+    plt.figure(figsize=(10,5))
+    sns.barplot(y=top_models.index, x=top_models.values, palette="cubehelix")
+    plt.title("Top camera models")
+    plt.xlabel("Count")
+    plt.tight_layout()
+    plt.savefig("top_camera_models.png", dpi=150)
+    plt.close()
+
+    df.to_csv("photos_summary.csv", index=False)
+    print("[INFO] Generated graphs and photos_summary.csv in current directory.")
+
+# ---------- Main pipeline ----------
+def scan_and_analyze(root_dir, db_path):
+    p = Path(root_dir)
+    if not p.exists():
+        print(f"[ERROR] Root directory {root_dir} not found.", file=sys.stderr)
+        return
+    conn = duckdb.connect(db_path)
+    init_db(conn)
+    tagger = Tagger()
+
+    # gather JPG/JPEG image files: suffix lowercased to match .jpg/.jpeg
+    files = [fp for fp in p.rglob("*") if fp.suffix.lower() in IMAGE_EXTS]
+    files = sorted(set(files))
+    print(f"[INFO] Found {len(files)} JPG/JPEG images. Processing...")
+
+    for fp in tqdm(files):
+        exif = extract_exif(fp)
+        tags = tagger.predict_tags(fp, topk=8)
+        categories = map_tags_to_categories(tags)
+        season = season_from_iso(exif.get("datetime_original"))
+        if season and season not in categories:
+            categories.append(season)
+        year = None
+        month = None
+        dto = exif.get("datetime_original")
+        if dto:
+            try:
+                dt = datetime.strptime(dto, "%Y-%m-%d %H:%M:%S")
+                year = dt.year
+                month = dt.month
+            except Exception:
+                year = None
+                month = None
+        rec = dict(exif)
+        rec.update({"tags": tags, "categories": categories, "season": season, "year": year, "month": month})
+        insert_record(conn, rec)
+
+    print("[INFO] Processing complete. Generating reports...")
+    generate_reports(conn)
+    conn.close()
+    print(f"[INFO] Done. Database saved to {db_path}.")
+
+# Keep init_db near bottom to avoid forward reference confusion in some environments
+def init_db(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS photos (
+        id TEXT PRIMARY KEY,
+        file_path TEXT,
+        file_name TEXT,
+        width INTEGER,
+        height INTEGER,
+        datetime_original TEXT,
+        year INTEGER,
+        month INTEGER,
+        season TEXT,
+        camera_make TEXT,
+        camera_model TEXT,
+        exposure_time TEXT,
+        f_number TEXT,
+        iso INTEGER,
+        focal_length TEXT,
+        tags TEXT,
+        categories TEXT
+    );
+    """)
+    conn.commit()
+
+if __name__ == "__main__":
+    scan_and_analyze(ROOT_DIR, DB_PATH)
